@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>Altitude + Carte + Satellite + Recherche + GPS</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background:#4ade80;
+    color:blue }
+    #map { height: 60vh; }
+
+    .panel {
+      padding: 12px 14px;
+      border-top: 1px solid #ddd;
+      display: grid;
+      gap: 10px;
+    }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .muted { color:#666; font-size:.95rem; }
+    .chip { background:#f3f3f3; padding:6px 10px; border-radius:999px; }
+    button { padding: 10px 12px; border: 0; border-radius: 10px; cursor: pointer; }
+    input {
+      padding: 10px 12px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      width: min(620px, 100%);
+      outline: none;
+    }
+
+    #results {
+      display: none;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      overflow: hidden;
+      max-width: 980px;
+    }
+    .resItem {
+      padding: 10px 12px;
+      border-bottom: 1px solid #eee;
+      cursor: pointer;
+      background: #fff;
+    }
+    .resItem:hover { background:#f7f7f7; }
+    .resTitle { font-weight: 700; }
+    .resMeta { color:#666; font-size:.92rem; margin-top: 3px; }
+    .resBadge {
+      display:inline-block;
+      font-size:.82rem;
+      padding:2px 8px;
+      border-radius:999px;
+      background:#f1f1ff;
+      margin-left: 8px;
+    }
+
+    /*petite note */
+    .note {
+      font-size: .70rem;
+      color: #666;
+      line-height: 1.3;
+    }
+    
+  
+    
+    
+  </style>
+</head>
+<body>
+
+
+<div class="panel">
+  <div class="row">
+    <button id="btnLocate">Me localiser</button>
+    <button id="btnCopy" disabled>Copier lat/lon</button>
+    <span class="muted">Clique sur la carte ou cherche un lieu → altitude du sol (m).</span>
+  </div>
+
+<div id="map"></div>
+  <div class="row">
+    <input id="q" placeholder="Recherche: quartier / lieu / adresse (ex: Maarif Casablanca, Hassan II, Twin Center)" />
+    <button id="btnSearch">Rechercher</button>
+    <button id="btnClear">Effacer</button>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="row">
+    <span class="chip"><b>Coordonnées :</b> <span id="coords">—</span></span>
+    <span class="chip"><b>Altitude (API) :</b> <span id="alt">—</span></span>
+  </div>
+
+  <div class="note">
+    Astuce: pour les quartiers/lieux locaux, écris <b>Nom + Ville</b> (ex: “Maarif Casablanca”).<br>
+    Le GPS web marche mieux en HTTPS. Altitude API = terrain (pas bâtiments).
+  </div>
+</div>
+
+<script>
+  // UI
+  const coordsEl = document.getElementById("coords");
+  const altEl = document.getElementById("alt");
+  const btnLocate = document.getElementById("btnLocate");
+  const btnCopy = document.getElementById("btnCopy");
+  const qEl = document.getElementById("q");
+  const btnSearch = document.getElementById("btnSearch");
+  const btnClear = document.getElementById("btnClear");
+  const resultsEl = document.getElementById("results");
+
+  // Map init (Casablanca par défaut)
+  const map = L.map('map', { zoomControl: true }).setView([33.5731, -7.5898], 12);
+
+  // Layers
+  const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
+  });
+
+  const esriSat = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 19, attribution: 'Tiles &copy; Esri' }
+  );
+
+  osm.addTo(map);
+
+  L.control.layers(
+    { "Plan (OSM)": osm, "Satellite (Esri)": esriSat },
+    null,
+    { position: "topright" }
+  ).addTo(map);
+
+  // Markers
+  let mainMarker = null;   // click/search marker
+  let userMarker = null;   // GPS marker
+  let lastLat = null, lastLon = null;
+
+  function placeMainMarker(lat, lon, label) {
+    lastLat = lat; lastLon = lon;
+    coordsEl.textContent = `${lat}, ${lon}`;
+    btnCopy.disabled = false;
+
+    const html = label ? `${label}<br><b>${lat}, ${lon}</b>` : `<b>${lat}, ${lon}</b>`;
+    if (!mainMarker) mainMarker = L.marker([lat, lon]).addTo(map);
+    else mainMarker.setLatLng([lat, lon]);
+    mainMarker.bindPopup(html).openPopup();
+  }
+
+  // Elevation API (terrain)
+  async function getElevationFromAPI(lat, lon) {
+    const url = `https://api.open-elevation.com/api/v1/lookup?locations=${lat},${lon}`;
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error("API elevation: erreur réseau");
+    const data = await r.json();
+    const elev = data?.results?.[0]?.elevation;
+    if (typeof elev !== "number") throw new Error("API elevation: altitude introuvable");
+    return elev; // mètres
+  }
+
+  async function updateAltitude(lat, lon, contextLabel) {
+    altEl.textContent = "…";
+    try {
+      const elev = await getElevationFromAPI(lat, lon);
+      altEl.textContent = `${elev.toFixed(1)} m`;
+
+      if (mainMarker) {
+        const ctx = contextLabel ? `${contextLabel}<br>` : "";
+        mainMarker.bindPopup(`${ctx}<b>${lat}, ${lon}</b><br>Altitude ≈ ${elev.toFixed(1)} m`).openPopup();
+      }
+    } catch (e) {
+      altEl.textContent = "Erreur (API)";
+    }
+  }
+
+  // Click on map -> marker + altitude
+  map.on('click', async (e) => {
+    hideResults();
+    const lat = +e.latlng.lat.toFixed(6);
+    const lon = +e.latlng.lng.toFixed(6);
+    placeMainMarker(lat, lon, "Point sélectionné");
+    await updateAltitude(lat, lon, "Point sélectionné");
+  });
+
+  // GPS locate
+  btnLocate.addEventListener("click", () => {
+    hideResults();
+    if (!navigator.geolocation) {
+      alert("Géolocalisation non supportée.");
+      return;
+    }
+    btnLocate.textContent = "Localisation…";
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      const { latitude, longitude, accuracy } = pos.coords;
+      const lat = +latitude.toFixed(6);
+      const lon = +longitude.toFixed(6);
+
+      // user marker
+      if (!userMarker) userMarker = L.circleMarker([lat, lon], { radius: 8 }).addTo(map);
+      else userMarker.setLatLng([lat, lon]);
+
+      userMarker.bindPopup(`Ma position<br><b>${lat}, ${lon}</b><br>Précision ≈ ${Math.round(accuracy)} m`).openPopup();
+
+      // main marker + altitude
+      placeMainMarker(lat, lon, "Ma position");
+      map.setView([lat, lon], 16);
+      await updateAltitude(lat, lon, "Ma position");
+
+      btnLocate.textContent = "Me localiser";
+    }, (err) => {
+      btnLocate.textContent = "Me localiser";
+      alert("Erreur GPS: " + err.message);
+    }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+  });
+
+  // Copy lat/lon
+  btnCopy.addEventListener("click", async () => {
+    if (lastLat === null) return;
+    const text = `${lastLat}, ${lastLon}`;
+    try {
+      await navigator.clipboard.writeText(text);
+      btnCopy.textContent = "Copié !";
+      setTimeout(() => btnCopy.textContent = "Copier lat/lon", 1200);
+    } catch {
+      prompt("Copie manuellement :", text);
+    }
+  });
+
+  // --- Search (Nominatim) with list results ---
+  function hideResults() {
+    resultsEl.style.display = "none";
+    resultsEl.innerHTML = "";
+  }
+
+  function prettyType(item) {
+    // Nominatim returns "type" and "class" (e.g., amenity, boundary, place)
+    const c = item.class || "";
+    const t = item.type || "";
+    if (!c && !t) return "";
+    return `${c}${t ? ":" + t : ""}`;
+  }
+
+  function shortName(item) {
+    // best effort
+    const nd = item.namedetails || {};
+    return nd.name || item.display_name || "Résultat";
+  }
+
+  async function nominatimSearch(query) {
+    // countrycodes=ma : Maroc
+    // accept-language=fr : réponses en français (quand possible)
+    // addressdetails/namedetails/extratags : + riche pour POI/quartiers
+    const url =
+      "https://nominatim.openstreetmap.org/search?" +
+      "format=jsonv2&addressdetails=1&namedetails=1&extratags=1" +
+      "&limit=10&accept-language=fr&countrycodes=ma" +
+      `&q=${encodeURIComponent(query)}`;
+
+    const r = await fetch(url, {
+      cache: "no-store",
+      headers: { "Accept": "application/json" }
+    });
+    if (!r.ok) throw new Error("Nominatim: erreur réseau / limite");
+    return await r.json();
+  }
+
+  function renderResults(items) {
+    if (!items.length) {
+      resultsEl.style.display = "block";
+      resultsEl.innerHTML = `<div class="resItem" style="cursor:default;border-bottom:0;">
+        Aucun résultat. Essaie <b>Nom + Ville</b> (ex: “Maarif Casablanca”, “Hassan II Casablanca”).
+      </div>`;
+      return;
+    }
+
+    resultsEl.style.display = "block";
+    resultsEl.innerHTML = items.map((it, idx) => {
+      const title = shortName(it);
+      const meta = it.display_name || "";
+      const badge = prettyType(it);
+      return `
+        <div class="resItem" data-idx="${idx}">
+          <div class="resTitle">${escapeHtml(title)}
+            ${badge ? `<span class="resBadge">${escapeHtml(badge)}</span>` : ""}
+          </div>
+          <div class="resMeta">${escapeHtml(meta)}</div>
+        </div>
+      `;
+    }).join("");
+
+    [...resultsEl.querySelectorAll(".resItem[data-idx]")].forEach(div => {
+      div.addEventListener("click", async () => {
+        const it = items[+div.dataset.idx];
+        const lat = +(+it.lat).toFixed(6);
+        const lon = +(+it.lon).toFixed(6);
+
+        hideResults();
+        placeMainMarker(lat, lon, "Résultat recherche");
+        map.setView([lat, lon], 16);
+        await updateAltitude(lat, lon, "Résultat recherche");
+      });
+    });
+  }
+
+  async function runSearch() {
+    const query = (qEl.value || "").trim();
+    if (!query) return;
+
+    resultsEl.style.display = "block";
+    resultsEl.innerHTML = `<div class="resItem" style="cursor:default;">Recherche…</div>`;
+
+    try {
+      const items = await nominatimSearch(query);
+      renderResults(items);
+    } catch (e) {
+      resultsEl.style.display = "block";
+      resultsEl.innerHTML = `<div class="resItem" style="cursor:default;border-bottom:0;">
+        Erreur recherche (réseau ou limite). Réessaie dans quelques secondes.
+      </div>`;
+    }
+  }
+
+  btnSearch.addEventListener("click", runSearch);
+  qEl.addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+
+  btnClear.addEventListener("click", () => {
+    qEl.value = "";
+    hideResults();
+  });
+
+  // helper: basic HTML escaping (safety)
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (m) => ({
+      "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#039;"
+    }[m]));
+  }
+</script>
+
+</body>
+</html>
